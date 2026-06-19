@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Discord Guild Agent Dashboard</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="Dashboard navigation">
+      <div class="brand-block">
+        <div class="brand-mark">DGA</div>
+        <div>
+          <h1>Guild Agent</h1>
+          <p>Dashboard</p>
+        </div>
+      </div>
+
+      <nav class="nav-list" aria-label="Sections">
+        <button class="nav-item active" data-section="overview">總覽</button>
+        <button class="nav-item" data-section="agents">Agents</button>
+        <button class="nav-item" data-section="queue">Queue</button>
+        <button class="nav-item" data-section="guilds">Guilds</button>
+        <button class="nav-item" data-section="logs">Logs</button>
+        <button class="nav-item" data-section="memory">Memory</button>
+        <button class="nav-item" data-section="tools">Tools</button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="status-dot" id="connection-dot"></div>
+        <span id="connection-label">連線中</span>
+      </div>
+    </aside>
+
+    <main class="main-panel">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Discord AI Agent 管理面板</p>
+          <h2 id="section-title">總覽</h2>
+        </div>
+        <div class="toolbar">
+          <select id="guild-select" aria-label="Guild selector">
+            <option value="">選擇 Guild</option>
+          </select>
+          <button id="refresh-button" type="button">刷新</button>
+        </div>
+      </header>
+
+      <section class="section active" id="section-overview">
+        <div class="metric-grid">
+          <article class="metric-card">
+            <span class="metric-label">Agents</span>
+            <strong id="metric-agents">0</strong>
+            <small id="metric-online">0 online</small>
+          </article>
+          <article class="metric-card">
+            <span class="metric-label">Queue</span>
+            <strong id="metric-queue">0</strong>
+            <small>pending tasks</small>
+          </article>
+          <article class="metric-card">
+            <span class="metric-label">Tools</span>
+            <strong id="metric-tools">0</strong>
+            <small>registered</small>
+          </article>
+          <article class="metric-card">
+            <span class="metric-label">Uptime</span>
+            <strong id="metric-uptime">0s</strong>
+            <small>current process</small>
+          </article>
+        </div>
+
+        <div class="content-grid two-col">
+          <section class="panel-block">
+            <div class="panel-heading">
+              <h3>Agents</h3>
+              <span id="agent-summary" class="muted-text">0 entries</span>
+            </div>
+            <div id="agent-list" class="list-stack"></div>
+          </section>
+
+          <section class="panel-block">
+            <div class="panel-heading">
+              <h3>Runtime</h3>
+              <span class="muted-text">live snapshot</span>
+            </div>
+            <dl class="definition-grid">
+              <dt>Council</dt>
+              <dd id="runtime-council">-</dd>
+              <dt>Override</dt>
+              <dd id="runtime-override">-</dd>
+              <dt>Processed</dt>
+              <dd id="runtime-processed">0</dd>
+              <dt>Failed</dt>
+              <dd id="runtime-failed">0</dd>
+            </dl>
+          </section>
+        </div>
+      </section>
+
+      <section class="section" id="section-agents">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Status</th>
+                <th>Personality</th>
+                <th>Context</th>
+                <th>Pending</th>
+              </tr>
+            </thead>
+            <tbody id="agents-table"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="section" id="section-queue">
+        <div class="metric-grid compact">
+          <article class="metric-card"><span class="metric-label">Priority</span><strong id="queue-priority">0</strong></article>
+          <article class="metric-card"><span class="metric-label">Normal</span><strong id="queue-normal">0</strong></article>
+          <article class="metric-card"><span class="metric-label">Retry</span><strong id="queue-retry">0</strong></article>
+          <article class="metric-card"><span class="metric-label">Failed</span><strong id="queue-failed">0</strong></article>
+        </div>
+        <div class="table-toolbar">
+          <select id="task-status-filter" aria-label="Task status filter">
+            <option value="all">All</option>
+            <option value="queued">Queued</option>
+            <option value="processing">Processing</option>
+            <option value="completed">Completed</option>
+            <option value="failed">Failed</option>
+            <option value="retry">Retry</option>
+          </select>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>Guild</th>
+                <th>Agent</th>
+                <th>Type</th>
+                <th>Status</th>
+                <th>Updated</th>
+              </tr>
+            </thead>
+            <tbody id="tasks-table"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="section" id="section-guilds">
+        <div id="guild-list" class="card-grid"></div>
+      </section>
+
+      <section class="section" id="section-logs">
+        <div class="empty-hint" id="logs-hint">請先選擇 Guild。</div>
+        <div class="table-wrap hidden" id="logs-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Kind</th>
+                <th>Time</th>
+                <th>Agent</th>
+                <th>Tool</th>
+                <th>Status</th>
+                <th>Reason</th>
+              </tr>
+            </thead>
+            <tbody id="logs-table"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="section" id="section-memory">
+        <div class="empty-hint" id="memory-hint">請先選擇 Guild。</div>
+        <div class="table-wrap hidden" id="memory-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Category</th>
+                <th>Key</th>
+                <th>Value</th>
+                <th>Confidence</th>
+                <th>Updated</th>
+              </tr>
+            </thead>
+            <tbody id="memory-table"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="section" id="section-tools">
+        <div class="tool-filter-row">
+          <input id="tool-search" type="search" placeholder="搜尋工具" aria-label="Tool search">
+        </div>
+        <div id="tool-list" class="tool-grid"></div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/assets/app.js" type="module"></script>
+</body>
+</html>
