@@ -213,6 +213,14 @@ class Agent:
         self._log = logger.bind(agent=config.name)
         self._recent_tool_calls: dict[str, float] = {}
 
+        # 資料庫查詢緩存（減少重複 I/O）
+        self._context_cache: dict[str, tuple[float, tuple[list, list, list]]] = {}
+        self._context_cache_ttl = 30  # 30秒緩存
+
+        # 權限查詢緩存（減少 Discord API 調用）
+        self._permission_cache: dict[str, tuple[float, str]] = {}
+        self._permission_cache_ttl = 300  # 5分鐘緩存
+
     # ---- 屬性 ----
 
     @property
@@ -454,15 +462,49 @@ class Agent:
         channel_id: str,
         exclude_message_ids: set[str] | None = None,
     ) -> None:
-        """從資料庫重建 Context。"""
-        recent_msgs = await self._msg_repo.get_recent(guild_id, channel_id, limit=20)
-        if exclude_message_ids:
-            recent_msgs = [
-                msg for msg in recent_msgs
-                if str(msg.get("message_id", "")) not in exclude_message_ids
-            ]
-        summaries = await self._summary_repo.get_latest(guild_id, channel_id, limit=3)
-        long_term = await self._long_term_memory.get_context_for_ai(guild_id)
+        """從資料庫重建 Context（帶緩存優化）。"""
+        cache_key = f"{guild_id}:{channel_id}"
+        now = time.time()
+
+        # 檢查緩存
+        if cache_key in self._context_cache:
+            cached_time, (cached_msgs, cached_summaries, cached_long_term) = self._context_cache[cache_key]
+            if now - cached_time < self._context_cache_ttl:
+                # 使用緩存，但排除當前訊息 ID
+                recent_msgs = list(cached_msgs)
+                if exclude_message_ids:
+                    recent_msgs = [
+                        msg for msg in recent_msgs
+                        if str(msg.get("message_id", "")) not in exclude_message_ids
+                    ]
+                summaries = cached_summaries
+                long_term = cached_long_term
+                self._log.debug("agent.context_cache_hit", key=cache_key)
+            else:
+                # 緩存過期，刪除並重新查詢
+                del self._context_cache[cache_key]
+                recent_msgs = await self._msg_repo.get_recent(guild_id, channel_id, limit=20)
+                if exclude_message_ids:
+                    recent_msgs = [
+                        msg for msg in recent_msgs
+                        if str(msg.get("message_id", "")) not in exclude_message_ids
+                    ]
+                summaries = await self._summary_repo.get_latest(guild_id, channel_id, limit=3)
+                long_term = await self._long_term_memory.get_context_for_ai(guild_id)
+                self._context_cache[cache_key] = (now, (recent_msgs, summaries, long_term))
+                self._log.debug("agent.context_cache_miss", key=cache_key)
+        else:
+            # 緩存未命中，查詢 DB
+            recent_msgs = await self._msg_repo.get_recent(guild_id, channel_id, limit=20)
+            if exclude_message_ids:
+                recent_msgs = [
+                    msg for msg in recent_msgs
+                    if str(msg.get("message_id", "")) not in exclude_message_ids
+                ]
+            summaries = await self._summary_repo.get_latest(guild_id, channel_id, limit=3)
+            long_term = await self._long_term_memory.get_context_for_ai(guild_id)
+            self._context_cache[cache_key] = (now, (recent_msgs, summaries, long_term))
+            self._log.debug("agent.context_cache_miss", key=cache_key)
 
         self._context.rebuild_from_db(
             recent_messages=recent_msgs,
@@ -473,17 +515,33 @@ class Agent:
         )
 
     def _build_self_permissions(self, guild_id: str) -> str:
-        """查詢 bot 自身在伺服器中的真實權限。
+        """查詢 bot 自身在伺服器中的真實權限（帶緩存優化）。
 
         讓 AI 知道自己能做什麼、不能做什麼，避免誤判。
         """
+        cache_key = f"self:{guild_id}"
+        now = time.time()
+
+        # 檢查緩存
+        if cache_key in self._permission_cache:
+            cached_time, cached_perms = self._permission_cache[cache_key]
+            if now - cached_time < self._permission_cache_ttl:
+                self._log.debug("agent.permission_cache_hit", key=cache_key)
+                return cached_perms
+            else:
+                del self._permission_cache[cache_key]
+
         guild = self._bot.get_guild(int(guild_id)) if guild_id.isdigit() else None
         if not guild or not self._bot.user:
-            return "（無法取得自身權限資訊）"
+            perms_str = "（無法取得自身權限資訊）"
+            self._permission_cache[cache_key] = (now, perms_str)
+            return perms_str
 
         member = guild.get_member(self._bot.user.id)
         if member is None:
-            return "（無法取得自身成員資料，可能不在快取中）"
+            perms_str = "（無法取得自身成員資料，可能不在快取中）"
+            self._permission_cache[cache_key] = (now, perms_str)
+            return perms_str
 
         key_perms = [
             "administrator",
@@ -508,9 +566,9 @@ class Agent:
         top_role = member.top_role.name if member.top_role else "@everyone"
 
         if is_owner:
-            return f"你是伺服器擁有者（擁有全部權限）｜最高身份組：{top_role}"
+            perms_str = f"你是伺服器擁有者（擁有全部權限）｜最高身份組：{top_role}"
         elif perms.administrator:
-            return f"你持有 administrator（等同擁有全部權限）｜最高身份組：{top_role}"
+            perms_str = f"你持有 administrator（等同擁有全部權限）｜最高身份組：{top_role}"
         else:
             held = [p for p in key_perms if getattr(perms, p, False)]
             missing = [p for p in key_perms if not getattr(perms, p, False)]
@@ -519,7 +577,11 @@ class Agent:
                 lines.append("✅ 擁有：" + ", ".join(held))
             if missing:
                 lines.append("❌ 缺少：" + ", ".join(missing))
-            return "｜".join(lines) if lines else "一般成員，無任何管理權限"
+            perms_str = "｜".join(lines) if lines else "一般成員，無任何管理權限"
+
+        self._permission_cache[cache_key] = (now, perms_str)
+        self._log.debug("agent.permission_cache_miss", key=cache_key)
+        return perms_str
 
     def _build_speaker_permissions(self, guild_id: str, batch: MessageBatch) -> str:
         """整理本批次中每位（非 bot）發話成員的真實伺服器權限。
