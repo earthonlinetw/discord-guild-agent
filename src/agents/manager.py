@@ -8,13 +8,19 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from typing import Any
 
 import discord
 
 import structlog
 
-from src.config.settings import AppConfig, AgentConfig
+from src.config.settings import (
+    AppConfig,
+    AgentConfig,
+    BufferedGuildEvent,
+    PendingGuildEventBatch,
+)
 from src.ai.provider import AIProvider
 from src.ai.context import ContextManager
 from src.memory.short_term import MessageCollector, MessageBatch, CollectedMessage
@@ -84,6 +90,9 @@ class AgentManager:
         self._council: Any = None
         # 主回應 bot（第一隻啟用的 Agent），負責一般聊天訊息
         self._primary_agent_name: str | None = None
+        # Guild event debounce/batch 狀態
+        self._pending_guild_events: dict[str, PendingGuildEventBatch] = {}
+        self._guild_event_lock = asyncio.Lock()
 
     # ---- 初始化 ----
 
@@ -285,6 +294,143 @@ class AgentManager:
             channel.name,
         )
 
+    def _guild_event_batch_key(self, guild_id: str, agent_name: str) -> str:
+        """建立 guild event 緩衝鍵。"""
+        return f"{guild_id}:{agent_name}"
+
+    def _format_guild_event_batch(
+        self,
+        events: list[BufferedGuildEvent],
+    ) -> tuple[str, str]:
+        """把多個 guild event 合併成單一 task 描述。"""
+        if len(events) == 1:
+            event = events[0]
+            return event.event_type, event.description
+
+        counts = Counter(event.event_type for event in events)
+        summary = ", ".join(
+            f"{event_type} x{count}" for event_type, count in sorted(counts.items())
+        )
+        lines = [
+            "[Guild Event Batch]",
+            f"count: {len(events)}",
+            f"summary: {summary}",
+            "",
+            "events:",
+        ]
+        for index, event in enumerate(events, start=1):
+            lines.append(f"{index}. [{event.event_type}]")
+            lines.append(event.description)
+            if index != len(events):
+                lines.append("")
+        return "guild_event_batch", "\n".join(lines)
+
+    async def _enqueue_guild_event_batch(
+        self,
+        *,
+        guild_id: str,
+        agent_name: str,
+        log_channel_id: str,
+        events: list[BufferedGuildEvent],
+    ) -> None:
+        """將合併後的 guild event 批次加入 queue。"""
+        event_type, description = self._format_guild_event_batch(events)
+        task = Task(
+            guild_id=guild_id,
+            agent_name=agent_name,
+            task_type="guild_event",
+            priority=TaskPriority.ADMIN,
+            payload={
+                "event_type": event_type,
+                "description": description,
+                "log_channel_id": log_channel_id,
+                "event_count": len(events),
+            },
+        )
+        await self._task_queue.enqueue(task)
+
+    async def _flush_pending_guild_event(self, key: str) -> None:
+        """排出指定 guild event 緩衝。"""
+        async with self._guild_event_lock:
+            pending = self._pending_guild_events.pop(key, None)
+            if pending is None or not pending.events:
+                return
+            current_task = asyncio.current_task()
+            flush_task = pending.flush_task
+            pending.flush_task = None
+
+        if flush_task is not None and flush_task is not current_task and not flush_task.done():
+            flush_task.cancel()
+
+        await self._enqueue_guild_event_batch(
+            guild_id=pending.guild_id,
+            agent_name=pending.agent_name,
+            log_channel_id=pending.log_channel_id,
+            events=list(pending.events),
+        )
+
+    async def _debounced_flush_guild_event(self, key: str) -> None:
+        """等待 debounce 視窗後排出 guild event 緩衝。"""
+        try:
+            await asyncio.sleep(max(0, self._config.guild_events.debounce_seconds))
+        except asyncio.CancelledError:
+            return
+        await self._flush_pending_guild_event(key)
+
+    async def _queue_guild_event(
+        self,
+        *,
+        guild_id: str,
+        agent_name: str,
+        log_channel_id: str,
+        event_type: str,
+        description: str,
+    ) -> None:
+        """將 guild event 先寫入 debounce 緩衝，再合併入 queue。"""
+        key = self._guild_event_batch_key(guild_id, agent_name)
+        previous_flush_task: asyncio.Task[None] | None = None
+        flush_immediately = False
+
+        async with self._guild_event_lock:
+            pending = self._pending_guild_events.get(key)
+            if pending is None:
+                pending = PendingGuildEventBatch(
+                    guild_id=guild_id,
+                    agent_name=agent_name,
+                    log_channel_id=log_channel_id,
+                )
+                self._pending_guild_events[key] = pending
+
+            pending.log_channel_id = log_channel_id
+            pending.events.append(
+                BufferedGuildEvent(event_type=event_type, description=description)
+            )
+
+            if pending.flush_task is not None and not pending.flush_task.done():
+                previous_flush_task = pending.flush_task
+
+            if len(pending.events) >= max(1, self._config.guild_events.max_batch_size):
+                pending.flush_task = None
+                flush_immediately = True
+            else:
+                pending.flush_task = asyncio.create_task(
+                    self._debounced_flush_guild_event(key),
+                    name=f"guild-event-flush-{key}",
+                )
+
+        if previous_flush_task is not None and not previous_flush_task.done():
+            previous_flush_task.cancel()
+
+        if flush_immediately:
+            await self._flush_pending_guild_event(key)
+
+    async def _flush_all_pending_guild_events(self) -> None:
+        """排出所有尚未送出的 guild event 緩衝。"""
+        async with self._guild_event_lock:
+            keys = list(self._pending_guild_events.keys())
+        for key in keys:
+            await self._flush_pending_guild_event(key)
+
     # ---- Discord 事件 ----
 
     def _register_bot_events(self, bot: discord.Client, agent: Agent) -> None:
@@ -324,18 +470,13 @@ class AgentManager:
                     event_type=event_type,
                 )
                 return
-            task = Task(
+            await self._queue_guild_event(
                 guild_id=str(guild.id),
                 agent_name=agent.name,
-                task_type="guild_event",
-                priority=TaskPriority.ADMIN,
-                payload={
-                    "event_type": event_type,
-                    "description": description,
-                    "log_channel_id": log_channel_id,
-                },
+                log_channel_id=log_channel_id,
+                event_type=event_type,
+                description=description,
             )
-            await self._task_queue.enqueue(task)
 
         def _format_changes(before: Any, after: Any, fields: list[str]) -> list[str]:
             changes: list[str] = []
@@ -735,18 +876,21 @@ class AgentManager:
         """停止所有 Bot 實例與服務。"""
         logger.info("agent_manager.stopping")
 
-        # 停止 Task Queue
-        if self._task_queue:
-            await self._task_queue.stop()
-
         # 關閉所有 Bot
         for name, bot in self._bots.items():
             await bot.close()
             logger.info("agent_manager.bot_closed", name=name)
 
+        # 排出暫存 guild events
+        await self._flush_all_pending_guild_events()
+
         # 排出暫存訊息
         if self._message_collector:
             await self._message_collector.flush_all()
+
+        # 停止 Task Queue
+        if self._task_queue:
+            await self._task_queue.stop()
 
         # 關閉資料庫
         await self._db.close()

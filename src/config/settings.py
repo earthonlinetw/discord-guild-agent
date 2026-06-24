@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import re
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -74,6 +75,8 @@ class GuildEventConfig(BaseModel):
     enabled: bool = True
     agent_name: str = "Bob"
     log_channel_name: str = "moderator-only"
+    debounce_seconds: int = 2
+    max_batch_size: int = 25
     include_events: list[str] = Field(
         default_factory=lambda: [
             "guild_update",
@@ -148,6 +151,25 @@ class AppConfig(BaseModel):
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     agents: list[AgentConfig] = Field(default_factory=list)
+
+
+@dataclass
+class BufferedGuildEvent:
+    """短時間內待合併的 guild event。"""
+
+    event_type: str
+    description: str
+
+
+@dataclass
+class PendingGuildEventBatch:
+    """單一 guild / agent 的暫存 guild event 批次。"""
+
+    guild_id: str
+    agent_name: str
+    log_channel_id: str
+    events: list[BufferedGuildEvent] = field(default_factory=list)
+    flush_task: Any = None
 
 
 # ============================================================
